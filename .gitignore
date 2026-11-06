@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# 本地语料与数据产物
+llm_corpus_chunks/
+data/processed/
+data/train_input/
+outputs/
+
+# 模型权重
+*.pt

@@ -1,0 +1,7 @@
+# TokenRain-100M-Base v0.2
+# On the GPU machine install a CUDA build of torch matching your driver/CUDA version.
+torch>=2.4
+numpy>=1.24
+PyYAML>=6.0
+# testing only
+pytest>=7.0

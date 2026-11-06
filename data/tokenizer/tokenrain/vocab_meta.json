@@ -1,0 +1,16 @@
+{
+  "version": "v0.2",
+  "level1": 3500,
+  "level2": 3000,
+  "level3_total": 1605,
+  "level3_kept": 1348,
+  "level3_excluded": 257,
+  "hanzi": 7848,
+  "symbols": 48,
+  "bytes": 256,
+  "specials": 4,
+  "piece_size": 8156,
+  "vocab_size": 8192,
+  "reserved": 36,
+  "frequency_source": "/home/charain/project/TinyMax/data/tokenizer/tokenrain/frequence.txt"
+}
