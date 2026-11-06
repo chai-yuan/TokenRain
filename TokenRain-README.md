@@ -139,6 +139,7 @@ raw_dirs/*.txt  ->  jsonl/{train,val}.jsonl  ->  packed/{train.bin,val.bin}
 - **切分与去重**：按空行分段，按 `doc_chars`（建议 2,000–4,000）拼文档；整篇 MD5 去重。
 - **划分**：`md5(source:idx) % 10000` 决定 train/val，默认 val_ratio 2%，确定性、重跑不漂移。
 - **打包**：文档用 `<bos> … <eos>` 包裹，按 seed 打乱后首尾相接，对齐到 4,096，以 `uint16`（有效位宽 13-bit）存盘。
+- **训练采样**：每个 epoch 以 `train.seed + epoch` 为随机种子生成序列级随机排列，按批随机读取；epoch 未跑完时也是全语料的均匀随机子集，续训从 `(epoch, cursor)` 确定性恢复。
 
 ## 定位
 

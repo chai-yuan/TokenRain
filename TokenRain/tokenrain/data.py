@@ -203,38 +203,57 @@ class PackedBin:
 
 
 class PackedBatchIterator:
-    """Sequential batches over a packed stream, wrapping around at the end."""
+    """Shuffled batches over a packed stream, reshuffling every epoch.
+
+    Each epoch visits every sequence exactly once in an order derived
+    deterministically from ``seed`` and the epoch index, so a partial epoch
+    samples uniformly across the whole corpus and resume only needs
+    ``(epoch, cursor)`` rather than RNG state.
+    """
 
     def __init__(self, path: str | Path, seq_len: int, batch_size: int,
-                 device: torch.device, offset_tokens: int = 0):
+                 device: torch.device, seed: int = 0,
+                 epoch: int = 0, cursor: int = 0):
         self.bin = PackedBin(path, seq_len)
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.device = device
-        self.offset = int(offset_tokens) % self.bin.num_tokens
-        self.epochs = 0
+        self.seed = int(seed) & 0xFFFFFFFFFFFFFFFF
+        self._offsets = np.arange(seq_len, dtype=np.int64)
+        self.epoch = int(epoch)
+        self._order = self._permutation(self.epoch)
+        self.cursor = 0
+        self.set_cursor(cursor)
+
+    def _permutation(self, epoch: int) -> np.ndarray:
+        rng = np.random.default_rng([self.seed, epoch & 0xFFFFFFFFFFFFFFFF])
+        return rng.permutation(self.bin.num_sequences)
 
     def state(self) -> Dict[str, int]:
-        return {"offset_tokens": self.offset, "epochs": self.epochs}
+        return {"epoch": self.epoch, "cursor": self.cursor}
 
-    def set_offset(self, offset_tokens: int) -> None:
-        self.offset = int(offset_tokens) % self.bin.num_tokens
+    def set_cursor(self, cursor: int) -> None:
+        self.cursor = int(cursor) % self.bin.num_sequences
+
+    def set_state(self, epoch: int, cursor: int) -> None:
+        self.epoch = int(epoch)
+        self._order = self._permutation(self.epoch)
+        self.set_cursor(cursor)
 
     def next_batch(self) -> torch.Tensor:
-        need = self.batch_size * self.seq_len
-        if self.bin.num_tokens == 0:
-            raise ValueError("packed stream is empty")
-        buf = np.empty(need, dtype=np.int64)
+        num_sequences = self.bin.num_sequences
+        indices = np.empty(self.batch_size, dtype=np.int64)
         filled = 0
-        while filled < need:
-            take = min(need - filled, self.bin.num_tokens - self.offset)
-            buf[filled:filled + take] = self.bin.data[
-                self.offset:self.offset + take]
+        while filled < self.batch_size:
+            take = min(self.batch_size - filled, num_sequences - self.cursor)
+            indices[filled:filled + take] = self._order[
+                self.cursor:self.cursor + take]
             filled += take
-            self.offset += take
-            if self.offset >= self.bin.num_tokens:
-                self.offset = 0
-                self.epochs += 1
-        x = torch.from_numpy(buf).reshape(
-            self.batch_size, self.seq_len).to(self.device)
-        return x
+            self.cursor += take
+            if self.cursor >= num_sequences:
+                self.cursor = 0
+                self.epoch += 1
+                self._order = self._permutation(self.epoch)
+        positions = indices[:, None] * self.seq_len + self._offsets
+        buf = np.asarray(self.bin.data[positions], dtype=np.int64)
+        return torch.from_numpy(buf).to(self.device)

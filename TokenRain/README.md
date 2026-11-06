@@ -55,5 +55,6 @@ python -m pytest tests -q
 - 学习率是固定值，只读取 `train.learning_rate`，训练全程不做 warmup 或衰减；需要调整时直接改 YAML，或用 `--set train.learning_rate=...` 临时覆盖。
 - `train.init_from` 只加载 checkpoint 中的模型权重，优化器、步数和数据位置从零开始，适合二次训练；`train.resume` 才是完整续训。两者同时命中时 `resume` 优先，且 `init_from` 的模型结构必须与当前 `model` 配置一致。
 - `build_vocab.py` 默认使用 `data/tokenizer/tokenrain/frequence.txt`（维基百科字频）挑选高频三级字；如果需要严格按本地语料选字，替换为同格式字频表后重新运行即可。
+- 训练数据按 epoch 随机读取：每个 epoch 用 `train.seed + epoch` 生成全部序列的随机排列，epoch 内每条序列恰好出现一次。因此即使 `total_tokens` 小于语料总量，训练也会均匀覆盖整个语料，而不是只读打包文件开头；同一 seed 下完全可复现，续训只保存 `(epoch, cursor)`，无需记录 RNG 状态。
 - 训练循环只支持单进程，去掉了 DDP、按秒日志、checkpoint 归档等非必要逻辑。
 - `generate.py` 为了保持代码精简，采用全量重算，没有实现 KV Cache。

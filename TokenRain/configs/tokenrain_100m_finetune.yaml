@@ -46,7 +46,7 @@ data:
   min_cjk_ratio: 0.5
 
 train:
-  seed: 42
+  seed: 42                    # 数据随机顺序由 seed 和当前 epoch 共同决定
   output_dir: outputs/tokenrain_100m_finetune
   total_tokens: 10_0000
   seq_len: 512

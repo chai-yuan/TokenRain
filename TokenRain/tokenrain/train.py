@@ -89,10 +89,13 @@ class Trainer:
 
         packed_dir = resolve_path(cfg.data.packed_dir)
         self.train_iter = PackedBatchIterator(
-            packed_dir / "train.bin", cfg.seq_len, self.micro, self.device)
+            packed_dir / "train.bin", cfg.seq_len, self.micro, self.device,
+            seed=tcfg.seed)
         passes = tcfg.total_tokens / max(1, self.train_iter.bin.num_tokens)
-        self.logger.info("training stream: %s tokens, ~%.1f passes over data",
-                         human_count(self.train_iter.bin.num_tokens), passes)
+        self.logger.info(
+            "training stream: %s tokens, ~%.1f passes, shuffled by "
+            "seed=%d and epoch", human_count(self.train_iter.bin.num_tokens),
+            passes, tcfg.seed)
         if passes > 3:
             self.logger.warning(
                 "target tokens repeat the corpus ~%.0f times; add data first",
@@ -196,8 +199,18 @@ class Trainer:
         self.tokens_seen = int(state.get("tokens_seen", 0))
         self._last_saved_tokens = self.tokens_seen
         data_state = state.get("data_state", {})
-        self.train_iter.set_offset(int(data_state.get("offset_tokens", 0)))
-        self.train_iter.epochs = int(data_state.get("epochs", 0))
+        if "epoch" in data_state or "cursor" in data_state:
+            self.train_iter.set_state(int(data_state.get("epoch", 0)),
+                                      int(data_state.get("cursor", 0)))
+        elif data_state:
+            # Legacy checkpoints tracked a sequential token offset.
+            offset = int(data_state.get("offset_tokens", 0))
+            cursor = (offset // self.cfg.seq_len) % \
+                self.train_iter.bin.num_sequences
+            self.train_iter.set_state(int(data_state.get("epochs", 0)), cursor)
+            self.logger.info(
+                "converted legacy data_state %s to epoch/cursor %s",
+                data_state, self.train_iter.state())
         self.logger.info("resumed %s at step %d (%s tokens)",
                          path.name, self.step, human_count(self.tokens_seen))
 
@@ -226,7 +239,8 @@ class Trainer:
         was_training = self.model.training
         self.model.eval()
         it = PackedBatchIterator(
-            self.val_bin.path, self.cfg.seq_len, self.micro, self.device)
+            self.val_bin.path, self.cfg.seq_len, self.micro, self.device,
+            seed=self.cfg.train.seed)
         total, count = 0.0, 0
         for _ in range(self.cfg.train.eval_batches):
             x = it.next_batch()

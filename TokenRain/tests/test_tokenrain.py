@@ -172,18 +172,56 @@ def test_actual_vocabulary_layout():
     assert tok.encode("ABC", add_special_tokens=False) == [69, 70, 71]
 
 
-def test_packed_batch_iterator(tmp_path):
+def _sequence_starts(it: PackedBatchIterator, batches: int):
+    starts = []
+    for _ in range(batches):
+        x = it.next_batch()
+        assert x.shape == (it.batch_size, it.seq_len)
+        for row in x:
+            start = int(row[0])
+            assert start % it.seq_len == 0
+            assert torch.equal(
+                row, torch.arange(start, start + it.seq_len))
+        starts.extend(int(v) for v in x[:, 0])
+    return starts
+
+
+def test_packed_batch_iterator_shuffles_per_epoch(tmp_path):
     path = tmp_path / "tiny.bin"
     n = write_bin(path, np.arange(256, dtype=np.uint16), 16)
     assert n == 256
-    it = PackedBatchIterator(path, 16, 2, torch.device("cpu"))
-    x = it.next_batch()
-    assert x.shape == (2, 16)
-    assert int(x[0, 0]) == 0 and int(x[1, 0]) == 16
-    for _ in range(10):
-        it.next_batch()
-    assert it.epochs >= 1
-    assert set(it.state()) == {"offset_tokens", "epochs"}
+    dev = torch.device("cpu")
+    all_starts = list(range(0, 256, 16))
+
+    it = PackedBatchIterator(path, 16, 2, dev, seed=7)
+    epoch0 = _sequence_starts(it, 8)
+    assert sorted(epoch0) == all_starts
+    assert epoch0 != all_starts
+    assert it.state() == {"epoch": 1, "cursor": 0}
+
+    mirror = PackedBatchIterator(path, 16, 2, dev, seed=7)
+    mirror.set_state(1, 0)
+    epoch1 = []
+    for _ in range(8):
+        a, b = it.next_batch(), mirror.next_batch()
+        assert torch.equal(a, b)
+        epoch1.extend(int(v) for v in a[:, 0])
+    assert sorted(epoch1) == all_starts
+    assert epoch1 != epoch0
+
+    other = PackedBatchIterator(path, 16, 2, dev, seed=8)
+    assert _sequence_starts(other, 8) != epoch0
+
+
+def test_partial_epoch_covers_whole_stream(tmp_path):
+    path = tmp_path / "tiny.bin"
+    n = write_bin(path, np.arange(1024, dtype=np.uint16), 16)
+    assert n == 1024
+    it = PackedBatchIterator(path, 16, 1, torch.device("cpu"), seed=42)
+    starts = _sequence_starts(it, 32)  # half of the 64 sequences
+    assert any(start < 512 for start in starts)
+    assert any(start >= 512 for start in starts)
+    assert starts != list(range(0, 512, 16))
 
 
 def test_optimizer_decay_groups():
@@ -241,6 +279,26 @@ def _tiny_train_config(tmp_path: Path, name: str, **overrides) -> Config:
 def _read_train_log(cfg: Config):
     path = Path(cfg.train.output_dir) / "train_log.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_trainer_resume_restores_data_cursor(tmp_path):
+    data_dir = ROOT.parent / "data/tokenizer/tokenrain"
+    if not (data_dir / "hanzi.txt").exists():
+        pytest.skip("run scripts/build_vocab.py first")
+
+    cfg = _tiny_train_config(tmp_path, "resume", total_tokens=16)
+    Trainer(cfg).train()
+    state = load_checkpoint(Path(cfg.train.output_dir) / "latest.pt")
+    assert state["tokens_seen"] == 16
+    assert set(state["data_state"]) == {"epoch", "cursor"}
+
+    resumed_cfg = _tiny_train_config(
+        tmp_path, "resume", total_tokens=24, resume="auto")
+    trainer = Trainer(resumed_cfg)
+    assert trainer.tokens_seen == 16
+    assert trainer.train_iter.state() == state["data_state"]
+    trainer.train()
+    assert _read_train_log(resumed_cfg)[-1]["step"] == 3
 
 
 def test_fixed_lr_and_init_from(tmp_path):
