@@ -88,12 +88,13 @@ class TrainConfig:
     precision: str = "bf16"
     learning_rate: float = 6e-4
     weight_decay: float = 0.1
-    warmup_ratio: float = 0.02
     grad_clip: float = 1.0
     log_every_steps: int = 10
     eval_interval_tokens: int = 100_000_000
     eval_batches: int = 8
     save_interval_tokens: int = 500_000_000
+    # Load only model weights from a checkpoint; optimizer and step stay fresh.
+    init_from: str = ""
     resume: str = "auto"
 
     def __post_init__(self) -> None:
@@ -138,11 +139,13 @@ class Config:
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Config":
+        train = dict(raw.get("train", {}))
+        train.pop("warmup_ratio", None)  # legacy checkpoints saved the old schedule
         return cls(
             version=str(raw.get("version", "v0.2")),
             model=_build(ModelConfig, raw.get("model", {})),
             data=_build(DataConfig, raw.get("data", {})),
-            train=_build(TrainConfig, raw.get("train", {})),
+            train=_build(TrainConfig, train),
         )
 
 

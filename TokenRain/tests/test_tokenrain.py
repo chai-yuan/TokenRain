@@ -1,6 +1,7 @@
 """CPU-friendly correctness tests for TokenRain v0.2."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -12,14 +13,14 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tokenrain.config import Config, ModelConfig, TrainConfig  # noqa: E402
+from tokenrain.config import Config, DataConfig, ModelConfig, TrainConfig  # noqa: E402
 from tokenrain.data import PackedBatchIterator, write_bin  # noqa: E402
 from tokenrain.model import (PartialRotaryEmbedding, TokenRainForCausalLM,  # noqa: E402
                              apply_rotary, build_causal_mask,
                              estimate_parameters, token_shift)
 from tokenrain.tokenizer import FixedCharTokenizer  # noqa: E402
-from tokenrain.train import build_optimizer, get_warmup_steps, lr_at  # noqa: E402
-from tokenrain.utils import count_parameters  # noqa: E402
+from tokenrain.train import Trainer, build_optimizer  # noqa: E402
+from tokenrain.utils import count_parameters, load_checkpoint  # noqa: E402
 
 
 def tiny_model_cfg(**kw) -> ModelConfig:
@@ -39,7 +40,7 @@ def test_config_and_parameter_budget():
     assert cfg.model.hidden_size == 1024
     assert cfg.model.partial_rope_dim == 32
     assert cfg.model.token_shift_dim == 256
-    assert cfg.sequences_per_step == 128
+    assert cfg.sequences_per_step == 2
     assert estimate_parameters(cfg.model) == 103_856_640
     overridden = Config.from_yaml(
         ROOT / "configs/tokenrain_100m.yaml",
@@ -190,16 +191,79 @@ def test_optimizer_decay_groups():
     opt = build_optimizer(model, TrainConfig())
     assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.1)
     assert opt.param_groups[1]["weight_decay"] == 0.0
+    assert all(g["lr"] == pytest.approx(TrainConfig().learning_rate)
+               for g in opt.param_groups)
     norm_ids = {id(p) for n, p in model.named_parameters() if "norm" in n}
     nodecay_ids = {id(p) for p in opt.param_groups[1]["params"]}
     assert norm_ids and norm_ids.issubset(nodecay_ids)
 
 
-def test_lr_schedule():
-    cfg = TrainConfig()
-    total = 1000
-    warmup = get_warmup_steps(total, cfg)
-    assert warmup == 20
-    assert lr_at(0, total, cfg) == pytest.approx(cfg.learning_rate / 20)
-    assert lr_at(warmup - 1, total, cfg) == pytest.approx(cfg.learning_rate)
-    assert lr_at(total, total, cfg) == pytest.approx(cfg.learning_rate * 0.1)
+def test_legacy_config_with_warmup_ratio_still_loads():
+    cfg = Config.from_dict({"train": {"learning_rate": 1e-4,
+                                      "warmup_ratio": 0.02}})
+    assert cfg.train.learning_rate == pytest.approx(1e-4)
+
+
+def _tiny_train_config(tmp_path: Path, name: str, **overrides) -> Config:
+    packed = tmp_path / "packed"
+    packed.mkdir(exist_ok=True)
+    write_bin(packed / "train.bin",
+              np.random.default_rng(0).integers(4, 8192, 128, dtype=np.uint16), 8)
+    data_dir = ROOT.parent / "data/tokenizer/tokenrain"
+    train = dict(
+        output_dir=str(tmp_path / name),
+        total_tokens=16,
+        seq_len=8,
+        global_batch_tokens=8,
+        micro_batch_size=1,
+        precision="fp32",
+        learning_rate=2e-4,
+        log_every_steps=1,
+        eval_interval_tokens=10**9,
+        save_interval_tokens=10**9,
+        eval_batches=1,
+        resume="none",
+    )
+    train.update(overrides)
+    return Config(
+        version="test",
+        model=tiny_model_cfg(vocab_size=8192),
+        data=DataConfig(
+            raw_dirs=[],
+            hanzi_file=str(data_dir / "hanzi.txt"),
+            symbols_file=str(data_dir / "symbols.txt"),
+            packed_dir=str(packed),
+        ),
+        train=TrainConfig(**train),
+    )
+
+
+def _read_train_log(cfg: Config):
+    path = Path(cfg.train.output_dir) / "train_log.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_fixed_lr_and_init_from(tmp_path):
+    data_dir = ROOT.parent / "data/tokenizer/tokenrain"
+    if not (data_dir / "hanzi.txt").exists():
+        pytest.skip("run scripts/build_vocab.py first")
+
+    base_cfg = _tiny_train_config(tmp_path, "base")
+    Trainer(base_cfg).train()
+    base_log = _read_train_log(base_cfg)
+    assert [r["step"] for r in base_log] == [1, 2]
+    assert all(r["lr"] == pytest.approx(2e-4) for r in base_log)
+
+    base_ckpt = Path(base_cfg.train.output_dir) / "latest.pt"
+    base_weights = load_checkpoint(base_ckpt)["model"]
+
+    ft_cfg = _tiny_train_config(
+        tmp_path, "finetune", total_tokens=8, learning_rate=5e-5,
+        init_from=str(base_ckpt))
+    trainer = Trainer(ft_cfg)
+    assert torch.equal(trainer.model.embed_tokens.weight.cpu(),
+                       base_weights["embed_tokens.weight"])
+    trainer.train()
+    ft_log = _read_train_log(ft_cfg)
+    assert ft_log[0]["step"] == 1
+    assert all(r["lr"] == pytest.approx(5e-5) for r in ft_log)

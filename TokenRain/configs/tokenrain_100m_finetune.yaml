@@ -1,0 +1,64 @@
+# TokenRain-100M 二次训练示例：从已有 checkpoint 仅加载模型权重。
+#
+# 与 resume 的区别：
+#   init_from  只恢复模型参数，优化器、步数、数据位置全部从零开始（适合微调）
+#   resume     完整续训（恢复优化器、步数、tokens_seen 和数据偏移）
+#
+# 用法：
+#   python scripts/run_train.py --config configs/tokenrain_100m_finetune.yaml
+# 临时改学习率：
+#   python scripts/run_train.py --config configs/tokenrain_100m_finetune.yaml \
+#       --set train.learning_rate=5.0e-5
+version: v0.2
+
+# model 必须与 init_from 指向的 checkpoint 架构完全一致。
+model:
+  vocab_size: 8192
+  hidden_size: 1024
+  num_hidden_layers: 14
+  num_attention_heads: 16
+  num_key_value_heads: 4
+  head_dim: 64
+  intermediate_size: 2048
+  max_position_embeddings: 4096
+  rope_theta: 10000.0
+  partial_rope_dim: 32        # 每个 head 前 32 维做 RoPE
+  token_shift_dim: 256        # 1/4 通道做 t-1 时间移位
+  rms_norm_eps: 1.0e-5
+  tie_word_embeddings: true
+  initializer_range: 0.02
+  pad_token_id: 0
+  bos_token_id: 1
+  eos_token_id: 2
+  unk_token_id: 3
+
+data:
+  raw_dirs:
+    - data/train_input
+  hanzi_file: data/tokenizer/tokenrain/hanzi.txt
+  symbols_file: data/tokenizer/tokenrain/symbols.txt
+  # 默认复用基础模型的打包数据；使用新语料时改掉 raw_dirs 和 packed_dir，
+  # 先运行 scripts/prepare_data.py --config configs/tokenrain_100m_finetune.yaml
+  packed_dir: data/processed/tokenrain_packed
+  val_ratio: 0.02
+  doc_chars: 3000
+  min_doc_chars: 100
+  min_cjk_ratio: 0.5
+
+train:
+  seed: 42
+  output_dir: outputs/tokenrain_100m_finetune
+  total_tokens: 10_0000
+  seq_len: 512
+  global_batch_tokens: 1024
+  micro_batch_size: 1
+  precision: fp32
+  learning_rate: 1.0e-4       # 固定学习率，训练全程不变，按需手动调整
+  weight_decay: 0.1
+  grad_clip: 1.0
+  log_every_steps: 5
+  eval_interval_tokens: 2_0000
+  eval_batches: 4
+  save_interval_tokens: 5_0000
+  init_from: outputs/tokenrain_100m/latest.pt
+  resume: none                # 不从 output_dir 续训，避免覆盖 init_from

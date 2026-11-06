@@ -43,7 +43,6 @@ train:
   precision: fp32
   learning_rate: 8.0e-4
   weight_decay: 0.1
-  warmup_ratio: 0.02
   grad_clip: 1.0
   log_every_steps: 5
   eval_interval_tokens: 10_0000

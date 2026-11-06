@@ -21,7 +21,6 @@ from .utils import (amp_settings, append_jsonl, count_parameters, get_logger,
 
 BETAS = (0.9, 0.95)
 EPS = 1e-8
-MIN_LR_RATIO = 0.1
 PROGRESS_INTERVAL_SECONDS = 30.0
 
 
@@ -45,27 +44,6 @@ def build_optimizer(model: torch.nn.Module,
     if torch.cuda.is_available():
         kwargs["fused"] = True
     return torch.optim.AdamW(groups, **kwargs)
-
-
-def get_warmup_steps(total_steps: int, cfg) -> int:
-    return max(1, int(total_steps * cfg.warmup_ratio))
-
-
-def lr_at(step: int, total_steps: int, cfg,
-          warmup_steps: Optional[int] = None) -> float:
-    peak = cfg.learning_rate
-    warmup = (get_warmup_steps(total_steps, cfg)
-              if warmup_steps is None else warmup_steps)
-    if step < warmup:
-        return peak * (step + 1) / warmup
-    progress = min(1.0, (step - warmup) / max(1, total_steps - warmup))
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return peak * (MIN_LR_RATIO + (1.0 - MIN_LR_RATIO) * cosine)
-
-
-def apply_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = lr
 
 
 class Trainer:
@@ -103,11 +81,10 @@ class Trainer:
                 "global batch adjusted: %d -> %d tokens/step",
                 tcfg.global_batch_tokens, self.tokens_per_step)
         self.total_steps = math.ceil(tcfg.total_tokens / self.tokens_per_step)
-        self.warmup_steps = get_warmup_steps(self.total_steps, tcfg)
         self.logger.info(
-            "steps=%d accum=%d micro=%d tokens/step=%s warmup=%d target=%s",
+            "steps=%d accum=%d micro=%d tokens/step=%s lr=%g target=%s",
             self.total_steps, self.accum, self.micro,
-            f"{self.tokens_per_step:,}", self.warmup_steps,
+            f"{self.tokens_per_step:,}", tcfg.learning_rate,
             human_count(tcfg.total_tokens))
 
         packed_dir = resolve_path(cfg.data.packed_dir)
@@ -141,7 +118,9 @@ class Trainer:
         self.tokens_seen = 0
         self._last_saved_tokens = -1
         self._copy_assets()
+        self._init_from_checkpoint()
         self._resume()
+        self._set_fixed_lr()
         self.next_eval = (
             (self.tokens_seen // tcfg.eval_interval_tokens) + 1
         ) * tcfg.eval_interval_tokens
@@ -168,19 +147,44 @@ class Trainer:
     def _checkpoint_path(self) -> Path:
         return self.output_dir / "latest.pt"
 
-    def _resume(self) -> None:
+    def _resume_target(self) -> Optional[Path]:
         tcfg = self.cfg.train
-        path: Optional[Path] = None
         if tcfg.resume == "auto":
             candidate = self._checkpoint_path()
-            if candidate.exists():
-                path = candidate
-        elif tcfg.resume and tcfg.resume != "none":
-            path = Path(tcfg.resume)
-            if not path.is_absolute():
-                path = resolve_path(tcfg.resume)
+            return candidate if candidate.exists() else None
+        if tcfg.resume and tcfg.resume != "none":
+            return resolve_path(tcfg.resume)
+        return None
+
+    def _init_from_checkpoint(self) -> None:
+        source = self.cfg.train.init_from
+        if not source or source == "none":
+            return
+        if self._resume_target() is not None:
+            self.logger.warning(
+                "resume checkpoint takes precedence; init_from=%s ignored",
+                source)
+            return
+        path = resolve_path(source)
+        if not path.exists():
+            raise FileNotFoundError(f"init_from checkpoint not found: {path}")
+        state = load_checkpoint(path)
+        try:
+            self.model.load_state_dict(state["model"])
+        except (KeyError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"cannot load model weights from {path}; "
+                "check that model.* matches the checkpoint") from exc
+        self.logger.info("initialized model weights from %s", path)
+
+    def _set_fixed_lr(self) -> None:
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.cfg.train.learning_rate
+
+    def _resume(self) -> None:
+        path = self._resume_target()
         if path is None or not path.exists():
-            self.logger.info("training from scratch")
+            self.logger.info("no resume checkpoint; starting a new run")
             return
         state = load_checkpoint(path, map_location="cpu")
         self.model.load_state_dict(state["model"])
@@ -238,14 +242,13 @@ class Trainer:
 
     def train(self) -> None:
         tcfg = self.cfg.train
+        lr = tcfg.learning_rate
         self.model.train()
         log_start = time.time()
         log_tokens = 0
         progress_time = time.time()
         progress_tokens = 0
         while self.tokens_seen < tcfg.total_tokens:
-            lr = lr_at(self.step, self.total_steps, tcfg, self.warmup_steps)
-            apply_lr(self.optimizer, lr)
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
             micro_tokens = self.micro * self.cfg.seq_len
